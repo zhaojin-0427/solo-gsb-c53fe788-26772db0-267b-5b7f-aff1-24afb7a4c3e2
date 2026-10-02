@@ -90,6 +90,8 @@ code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; font-size: 12p
 
 .banner { border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
 .banner.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); }
+.banner.unproven { background: #fff7ed; border: 1px solid #ea580c; color: #7c2d12; }
+.banner.unproven div { margin-top: 4px; color: #9a3412; font-size: 13px; }
 
 #conflict-panel { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
 #conflict-panel h2 { color: var(--danger); margin-top: 0; }

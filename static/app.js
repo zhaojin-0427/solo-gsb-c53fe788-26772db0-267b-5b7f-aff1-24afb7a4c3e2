@@ -8,7 +8,7 @@ const state = {
   reservations: [],
   version: null,
   latestPublishedPlanId: null,
-  preview: null, // 当前展示的预览 payload（feasible 时）
+  preview: null, // 当前展示的可发布预览 payload（仅 proven_optimal）
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -367,7 +367,9 @@ $("#btn-preview").addEventListener("click", generatePreview);
 async function generatePreview() {
   try {
     const result = await api("/api/plans/preview", { method: "POST" });
-    state.preview = result.feasible ? result : null;
+    // 仅“已证最优且可发布”的预览进入 state；未证最优结果只渲染、不能发布
+    state.preview =
+      result.optimality_status === "proven_optimal" && result.feasible ? result : null;
     renderPreview(result);
     await refreshVersion();
   } catch (err) {
@@ -377,11 +379,13 @@ async function generatePreview() {
 
 function renderPreview(p) {
   const conflictPanel = $("#conflict-panel");
+  const unprovenPanel = $("#unproven-panel");
   const migrationPanel = $("#migration-panel");
   const allocPanel = $("#alloc-panel");
 
-  if (!p.feasible) {
+  if (p.optimality_status === "infeasible" || p.feasible === false) {
     conflictPanel.classList.remove("hidden");
+    unprovenPanel.classList.add("hidden");
     migrationPanel.classList.add("hidden");
     allocPanel.classList.add("hidden");
     $("#tracks").innerHTML = "";
@@ -393,11 +397,36 @@ function renderPreview(p) {
     return;
   }
 
+  if (p.optimality_status === "unproven") {
+    // 与“无解”区分：可能带有现任解用于可视化，但没有 plan_id、不能发布
+    unprovenPanel.classList.remove("hidden");
+    $("#unproven-msg").textContent =
+      p.message || "求解器限时内未证明该方案最优；该预览不可发布，请重试或调整配置。";
+    conflictPanel.classList.add("hidden");
+    $("#btn-publish").disabled = true;
+    $("#plan-summary").textContent =
+      "未证最优（不可发布）" +
+      (p.migration_count != null
+        ? ` · 现任解：迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路`
+        : " · 暂无可行现任解");
+    if (p.allocations && p.allocations.length) {
+      allocPanel.classList.remove("hidden");
+      renderTracks(p.occupancy);
+      renderMigrations(p.migrations);
+      renderAllocations(p.allocations);
+    } else {
+      allocPanel.classList.add("hidden");
+      migrationPanel.classList.add("hidden");
+      $("#tracks").innerHTML = "";
+    }
+    return;
+  }
+
+  unprovenPanel.classList.add("hidden");
   conflictPanel.classList.add("hidden");
   allocPanel.classList.remove("hidden");
   $("#plan-summary").textContent =
-    `预览 #${p.plan_id} · 基于配置 v${p.config_version} · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路` +
-    (p.tie_exact === false ? " · 规模较大，字典序为近似最优" : "");
+    `预览 #${p.plan_id} · 基于配置 v${p.config_version} · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路 · ✅ 已证三级最优`;
 
   renderTracks(p.occupancy);
   renderMigrations(p.migrations);
@@ -481,7 +510,18 @@ function renderAllocations(allocations) {
 
 $("#btn-publish").addEventListener("click", async () => {
   if (!state.preview) return;
-  if (!confirm("确认按当前预览原子发布？发布后旧预览立即失效。")) return;
+  // 浏览器端双保险：未证最优的结果绝不允许发布
+  if (state.preview.optimality_status !== "proven_optimal") {
+    toast("该预览未证明最优，不可发布；请重新生成预览。", "error");
+    $("#btn-publish").disabled = true;
+    return;
+  }
+  if (state.preview.config_version !== state.version) {
+    toast("配置已变化，请重新生成预览后再发布。", "error");
+    $("#btn-publish").disabled = true;
+    return;
+  }
+  if (!confirm("确认按当前已证最优预览原子发布？发布后旧预览立即失效。")) return;
   try {
     const result = await api(`/api/plans/${state.preview.plan_id}/publish`, { method: "POST" });
     toast(`已发布 #${result.plan_id}（配置 v${result.config_version}）`, "success");
@@ -510,7 +550,8 @@ async function loadPublished() {
   content.classList.remove("hidden");
   const when = new Date(data.created_at).toLocaleString("zh-CN");
   $("#published-meta").textContent =
-    `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路`;
+    `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路` +
+    (data.optimality_status === "proven_optimal" ? " · ✅ 已证最优" : " · ⚠️ 无最优性证明（旧数据）");
   $("#btn-download-csv").href = `/api/plans/published/${data.plan_id}/csv`;
   $("#published-tbody").innerHTML = data.allocations
     .map(

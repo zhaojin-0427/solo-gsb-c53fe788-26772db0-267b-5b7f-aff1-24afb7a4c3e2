@@ -115,6 +115,11 @@ class Plan(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     config_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    # 最优性证明状态：proven_optimal / unproven。
+    # 仅 proven_optimal 的草稿允许发布；旧库回填为 unproven（旧草稿一律拒发）。
+    optimality_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unproven", server_default="unproven"
+    )
     migration_count: Mapped[int] = mapped_column(Integer, nullable=False)
     used_lines: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)

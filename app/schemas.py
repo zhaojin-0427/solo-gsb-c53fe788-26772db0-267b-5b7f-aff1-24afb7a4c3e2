@@ -148,6 +148,7 @@ class PlanOut(BaseModel):
     id: int
     config_version: int
     status: str
+    optimality_status: str = "unproven"
     migration_count: int
     used_lines: int
     created_at: datetime
@@ -160,6 +161,7 @@ class PublishResult(BaseModel):
     ok: bool
     plan_id: int
     config_version: int
+    optimality_status: str
     published_at: datetime
 
 

@@ -3,15 +3,34 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import update
+from sqlalchemy import text, update
 from sqlalchemy.orm import Session
 
 from .database import Base, engine
 from .models import ConfigVersion, Line
 
 
+def _migrate_schema() -> None:
+    """对既有数据库做轻量列迁移（SQLite 无 ALTER IF NOT EXISTS）。
+
+    plans.optimality_status 是后加列：旧库里的草稿/发布记录没有最优性证明，
+    一律回填为 'unproven'，使旧草稿在发布时被拒绝。
+    """
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(plans)"))}
+        if cols and "optimality_status" not in cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE plans ADD COLUMN optimality_status VARCHAR(32) "
+                    "NOT NULL DEFAULT 'unproven'"
+                )
+            )
+            conn.execute(text("UPDATE plans SET optimality_status = 'unproven'"))
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
     with Session(engine) as db:
         if db.get(ConfigVersion, 1) is None:
             db.add(ConfigVersion(id=1, version=1))

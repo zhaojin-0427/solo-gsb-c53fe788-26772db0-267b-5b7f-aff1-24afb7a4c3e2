@@ -55,17 +55,23 @@ def create_preview(db: Session) -> dict:
     spec = build_spec(db)
     result = solver.solve(spec)
     version = get_config_version(db)
-    if not result.feasible:
+    if result.optimality_status == solver.STATUS_INFEASIBLE:
         return {
             "feasible": False,
+            "optimality_status": solver.STATUS_INFEASIBLE,
             "config_version": version,
             "conflicts": result.conflicts,
             "occupancy": [],
         }
 
+    if result.optimality_status == solver.STATUS_UNPROVEN:
+        # 未证最优：现任解（若有）仅供展示，绝不生成可发布草稿
+        return _incumbent_payload(db, spec, result, version)
+
     plan = Plan(
         config_version=version,
         status="draft",
+        optimality_status=solver.STATUS_PROVEN_OPTIMAL,
         migration_count=result.migration_count,
         used_lines=result.used_lines,
     )
@@ -84,8 +90,53 @@ def create_preview(db: Session) -> dict:
         )
     db.commit()
     db.refresh(plan)
-    payload = _plan_payload(db, plan, feasible=True)
-    payload["tie_exact"] = result.tie_exact
+    return _plan_payload(db, plan, feasible=True)
+
+
+def _incumbent_payload(db: Session, spec: solver.SolveSpec, result: solver.SolveResult, version: int) -> dict:
+    """未证最优时的响应：与“无解”区分；现任解仅用于可视化，无 plan_id、不可发布。"""
+    payload = {
+        "feasible": bool(result.feasible),
+        "optimality_status": solver.STATUS_UNPROVEN,
+        "config_version": version,
+        "conflicts": [],
+        "unproven_phase": result.phase,
+        "unproven_fixture_id": result.fixture_id,
+        "message": result.message,
+    }
+    if result.allocations:
+        alloc_out = [
+            {
+                "fixture_id": a.fixture_id,
+                "name": a.name,
+                "line_id": a.line_id,
+                "start": a.start,
+                "end": a.end,
+                "channels": a.channels,
+                "migrated": a.migrated,
+                "locked": a.locked,
+            }
+            for a in sorted(result.allocations, key=lambda a: a.fixture_id)
+        ]
+        payload.update(
+            {
+                "migration_count": result.migration_count,
+                "used_lines": result.used_lines,
+                "allocations": alloc_out,
+                "migrations": _migrations_from_alloc(db, alloc_out),
+                "occupancy": result.occupancy,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "migration_count": None,
+                "used_lines": None,
+                "allocations": [],
+                "migrations": [],
+                "occupancy": [],
+            }
+        )
     return payload
 
 
@@ -117,6 +168,7 @@ def _plan_payload(db: Session, plan: Plan, *, feasible: bool = True) -> dict:
         "plan_id": plan.id,
         "config_version": plan.config_version,
         "status": plan.status,
+        "optimality_status": plan.optimality_status,
         "migration_count": plan.migration_count,
         "used_lines": plan.used_lines,
         "created_at": plan.created_at,
@@ -209,13 +261,21 @@ def latest_published(db: Session) -> Plan | None:
 
 
 def publish_plan(db: Session, plan_id: int) -> dict:
-    """原子发布：版本必须与当前配置一致，旧预览一律拒绝。"""
+    """原子发布：版本必须与当前配置一致，且草稿必须持有三级最优性证明。"""
     current_version = get_config_version(db)
     plan = db.get(Plan, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="预览不存在")
     if plan.status != "draft":
         raise HTTPException(status_code=409, detail=f"该预览已为 {plan.status} 状态，不能重复发布")
+    if plan.optimality_status != solver.STATUS_PROVEN_OPTIMAL:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "该预览未持有三级目标（迁移台数→启用线路数→字典序）的最优性证明，"
+                "不可发布；请重新生成预览并在返回 proven_optimal 后再发布。"
+            ),
+        )
     if plan.config_version != current_version:
         raise HTTPException(
             status_code=409,
@@ -254,5 +314,6 @@ def publish_plan(db: Session, plan_id: int) -> dict:
         "ok": True,
         "plan_id": plan.id,
         "config_version": new_version,
+        "optimality_status": plan.optimality_status,
         "published_at": now,
     }
