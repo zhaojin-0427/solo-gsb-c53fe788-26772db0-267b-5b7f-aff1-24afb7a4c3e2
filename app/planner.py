@@ -55,17 +55,23 @@ def create_preview(db: Session) -> dict:
     spec = build_spec(db)
     result = solver.solve(spec)
     version = get_config_version(db)
-    if not result.feasible:
+    if result.optimality == solver.INFEASIBLE:
         return {
             "feasible": False,
+            "optimality_status": solver.INFEASIBLE,
             "config_version": version,
             "conflicts": result.conflicts,
             "occupancy": [],
         }
 
+    if not result.is_optimal:
+        # 存在可行候选但未能逐级证明最优：可展示，绝不生成可发布草稿。
+        return _candidate_payload(db, result, version)
+
     plan = Plan(
         config_version=version,
         status="draft",
+        optimality_status=solver.OPTIMAL,
         migration_count=result.migration_count,
         used_lines=result.used_lines,
     )
@@ -84,9 +90,55 @@ def create_preview(db: Session) -> dict:
         )
     db.commit()
     db.refresh(plan)
-    payload = _plan_payload(db, plan, feasible=True)
-    payload["tie_exact"] = result.tie_exact
-    return payload
+    return _plan_payload(db, plan, feasible=True)
+
+
+def _candidate_payload(db: Session, result: solver.SolveResult, version: int) -> dict:
+    """未证最优时返回的候选预览（无 plan_id，不可发布）。"""
+    names = {f.id: f.name for f in db.query(Fixture).all()}
+    locked_ids = {f.id for f in db.query(Fixture).filter(Fixture.locked.is_(True)).all()}
+    prev = {f.id: (f.previous_line, f.previous_start, f.locked) for f in db.query(Fixture).all()}
+    alloc_out = [
+        {
+            "fixture_id": a.fixture_id,
+            "name": names.get(a.fixture_id, f"#{a.fixture_id}"),
+            "line_id": a.line_id,
+            "start": a.start,
+            "end": a.end,
+            "channels": a.channels,
+            "migrated": a.migrated,
+            "locked": a.fixture_id in locked_ids,
+        }
+        for a in result.allocations
+    ]
+    migrations = []
+    for a in alloc_out:
+        old_line, old_start, _locked = prev.get(a["fixture_id"], (None, None, False))
+        if old_line is not None and (old_line, old_start) != (a["line_id"], a["start"]):
+            migrations.append(
+                {
+                    "fixture_id": a["fixture_id"],
+                    "name": a["name"],
+                    "from_line": old_line,
+                    "from_start": old_start,
+                    "to_line": a["line_id"],
+                    "to_start": a["start"],
+                    "locked": a["fixture_id"] in locked_ids,
+                }
+            )
+    return {
+        "feasible": True,
+        "optimality_status": solver.UNPROVEN,
+        "unproven_stage": result.unproven_stage,
+        "message": result.unproven_message,
+        "config_version": version,
+        "migration_count": result.migration_count,
+        "used_lines": result.used_lines,
+        "allocations": alloc_out,
+        "migrations": migrations,
+        "occupancy": result.occupancy,
+        "conflicts": result.conflicts,
+    }
 
 
 def _plan_payload(db: Session, plan: Plan, *, feasible: bool = True) -> dict:
@@ -117,6 +169,7 @@ def _plan_payload(db: Session, plan: Plan, *, feasible: bool = True) -> dict:
         "plan_id": plan.id,
         "config_version": plan.config_version,
         "status": plan.status,
+        "optimality_status": plan.optimality_status,
         "migration_count": plan.migration_count,
         "used_lines": plan.used_lines,
         "created_at": plan.created_at,
@@ -216,6 +269,16 @@ def publish_plan(db: Session, plan_id: int) -> dict:
         raise HTTPException(status_code=404, detail="预览不存在")
     if plan.status != "draft":
         raise HTTPException(status_code=409, detail=f"该预览已为 {plan.status} 状态，不能重复发布")
+    if plan.optimality_status != solver.OPTIMAL:
+        if plan.optimality_status is None:
+            raise HTTPException(
+                status_code=409,
+                detail="该预览由旧版本生成、没有最优性证明记录，不能发布，请重新生成预览。",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"该预览的最优性状态为 {plan.optimality_status}，未逐级证明最优，不能发布，请重新生成预览。",
+        )
     if plan.config_version != current_version:
         raise HTTPException(
             status_code=409,
@@ -254,5 +317,6 @@ def publish_plan(db: Session, plan_id: int) -> dict:
         "ok": True,
         "plan_id": plan.id,
         "config_version": new_version,
+        "optimality_status": solver.OPTIMAL,
         "published_at": now,
     }

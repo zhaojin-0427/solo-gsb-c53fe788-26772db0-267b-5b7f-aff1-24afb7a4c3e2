@@ -5,10 +5,14 @@
 - 同一线路上灯具之间、灯具与保留区之间不重叠；
 - 锁定灯具必须使用既有线路与起始地址。
 
-目标（按优先级）：
+目标（按优先级，前一级未证明最优前不得固定其值继续下一级）：
 1. 已配灯具迁移台数最少；
 2. 启用线路数最少；
 3. 按灯具 ID 排序，逐台取（线路 ID, 起始地址）字典序最小。
+
+每个阶段只接受 CP-SAT 的 OPTIMAL：限时内仅得到 FEASIBLE（可行 incumbent）
+时返回“未证最优”（unproven）状态，与真正的 INFEASIBLE 明确区分，且不会
+把未证明的取值固定后继续后续阶段。
 
 无解时返回可读的冲突约束诊断。
 """
@@ -23,7 +27,27 @@ SOLVE_SECONDS_PHASE = 5.0
 SOLVE_SECONDS_TIE = 1.5
 # 字典序破局目标中“线路优先于起始地址”的权重（起始地址最大 512）
 LINE_PRIORITY_WEIGHT = 1024
-_FEASIBLE_STATUSES = (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+# 求解结论三态：optimal 已逐级证明最优；infeasible 已证明无解；
+# unproven 限时内只拿到可行候选，未能证明某一级最优。
+OPTIMAL = "optimal"
+INFEASIBLE = "infeasible"
+UNPROVEN = "unproven"
+
+_UNPROVEN_MESSAGES = {
+    "migration": (
+        "第一阶段（已配灯具迁移台数最少）在限定时间内仅找到可行解，"
+        "未能证明迁移台数最少；未生成可发布草稿，请减少灯具数量或稍后重试。"
+    ),
+    "lines": (
+        "第二阶段（启用线路数最少）在限定时间内仅找到可行解，"
+        "未能证明启用线路数最少；未生成可发布草稿，请重试。"
+    ),
+    "lexicographic": (
+        "字典序破局阶段在限定时间内未能逐台证明（线路 ID、起始地址）字典序最小；"
+        "未生成可发布草稿，请重试。"
+    ),
+}
 
 
 def _params(seconds: float, *, first_solution: bool = False) -> cp_model.sat_parameters_pb2.SatParameters:
@@ -84,14 +108,30 @@ class Allocation:
 
 @dataclass
 class SolveResult:
-    feasible: bool
+    # optimal（逐级证明最优）/ infeasible（已证无解）/ unproven（存在可行候选但未证最优）
+    optimality: str
     allocations: list[Allocation] = field(default_factory=list)
     migration_count: int = 0
     used_lines: int = 0
     conflicts: list[dict] = field(default_factory=list)
     occupancy: list[dict] = field(default_factory=list)
-    # 第三级字典序目标是否取到了精确最优（规模过大时回退为启发式）
-    tie_exact: bool = True
+    # 未证最优时停在哪个阶段：migration / lines / lexicographic
+    unproven_stage: str | None = None
+    unproven_message: str = ""
+
+    @property
+    def feasible(self) -> bool:
+        """是否存在可用的可行排布（含未证最优的候选）。"""
+        return self.optimality != INFEASIBLE and bool(self.allocations)
+
+    @property
+    def is_optimal(self) -> bool:
+        return self.optimality == OPTIMAL
+
+    @property
+    def has_candidate(self) -> bool:
+        """未证最优时是否仍带回了可展示（但不可发布）的可行候选。"""
+        return bool(self.allocations)
 
 
 class _ModelArtifacts:
@@ -316,7 +356,7 @@ def _diagnose(spec: SolveSpec) -> SolveResult:
     solver.parameters.CopyFrom(_params(SOLVE_SECONDS_PHASE))
     status = solver.Solve(model)
 
-    if status in _FEASIBLE_STATUSES:
+    if status == cp_model.OPTIMAL:
         bad_locks = [fid for fid, v in art.relax.items() if solver.Value(v) == 1]
         if bad_locks:
             fix_by_id = {f.id: f for f in spec.fixtures}
@@ -335,10 +375,26 @@ def _diagnose(spec: SolveSpec) -> SolveResult:
                 }
                 for fid in sorted(bad_locks)
             ]
-            return SolveResult(feasible=False, conflicts=conflicts)
+            return SolveResult(optimality=INFEASIBLE, conflicts=conflicts)
+    elif status == cp_model.FEASIBLE:
+        # 只拿到一个可行（放宽了锁）的 incumbent，未能证明必须放宽哪些锁：
+        # 不能据此宣布硬约束无解。
+        return SolveResult(
+            optimality=UNPROVEN,
+            unproven_stage="diagnosis",
+            unproven_message="冲突诊断阶段超时：无法证明候选冲突是否必然，请减少灯具数量或放宽部分锁定后重试。",
+            conflicts=[
+                {
+                    "type": "solver_timeout",
+                    "message": "冲突诊断阶段超时：约束可能过于紧张，请减少灯具数量或放宽部分锁定后重试。",
+                }
+            ],
+        )
     elif status == cp_model.UNKNOWN:
         return SolveResult(
-            feasible=False,
+            optimality=UNPROVEN,
+            unproven_stage="diagnosis",
+            unproven_message="冲突诊断阶段超时：约束可能过于紧张，请减少灯具数量或放宽部分锁定后重试。",
             conflicts=[
                 {
                     "type": "solver_timeout",
@@ -355,7 +411,7 @@ def _diagnose(spec: SolveSpec) -> SolveResult:
     free = sum(LINE_SIZE - len(s) for s in occupied.values())
     demand = sum(f.channels for f in spec.fixtures)
     return SolveResult(
-        feasible=False,
+        optimality=INFEASIBLE,
         conflicts=[
             {
                 "type": "infeasible",
@@ -373,82 +429,79 @@ def _diagnose(spec: SolveSpec) -> SolveResult:
 def solve(spec: SolveSpec) -> SolveResult:
     conflicts = _precheck(spec)
     if conflicts:
-        return SolveResult(feasible=False, conflicts=conflicts)
+        return SolveResult(optimality=INFEASIBLE, conflicts=conflicts)
 
     sorted_fixtures = sorted(spec.fixtures, key=lambda f: f.id)
     active_lines = [l for l in spec.lines if l.active]
     line_ids = [l.id for l in active_lines]
 
-    def fresh_hard_model():
-        return _build_model(spec, relax_locks=False)
-
-    solver = cp_model.CpSolver()
-
-    # 第一阶段：迁移最少
-    model1, art1 = fresh_hard_model()
+    # 第一阶段：最小化迁移台数。只有 OPTIMAL 才采信目标值；FEASIBLE/UNKNOWN
+    # 一律作为“未证最优”返回，绝不固定 incumbent 后继续后续阶段。
+    model1, art1 = _build_model(spec, relax_locks=False)
     model1.Minimize(art1.total_mig)
     solver = cp_model.CpSolver()
     solver.parameters.CopyFrom(_params(SOLVE_SECONDS_PHASE))
     s1 = solver.Solve(model1)
     if s1 == cp_model.INFEASIBLE:
         return _diagnose(spec)
-    if s1 not in _FEASIBLE_STATUSES:
-        return SolveResult(
-            feasible=False,
-            conflicts=[
-                {
-                    "type": "solver_timeout",
-                    "message": "求解器在限定时间内未能完成第一阶段求解，请减少灯具数量或放宽约束后重试。",
-                }
-            ],
-        )
+    if s1 != cp_model.OPTIMAL:
+        candidate = _candidate_from(solver, s1, art1, spec, sorted_fixtures, line_ids)
+        return _unproven_result("migration", spec, candidate)
     min_mig = solver.Value(art1.total_mig)
 
-    # 第二阶段：迁移数固定，启用线路最少
-    model2, art2 = fresh_hard_model()
+    # 第二阶段：迁移数固定为已证最优值，最小化启用线路数。
+    model2, art2 = _build_model(spec, relax_locks=False)
     model2.Add(art2.total_mig == min_mig)
     model2.Minimize(art2.total_used)
+    solver = cp_model.CpSolver()
+    solver.parameters.CopyFrom(_params(SOLVE_SECONDS_PHASE))
     s2 = solver.Solve(model2)
     if s2 == cp_model.INFEASIBLE:
         return _diagnose(spec)
-    if s2 not in _FEASIBLE_STATUSES:
-        return SolveResult(
-            feasible=False,
-            conflicts=[
-                {
-                    "type": "solver_timeout",
-                    "message": "求解器在限定时间内未能完成第二阶段求解，请重试。",
-                }
-            ],
-        )
+    if s2 != cp_model.OPTIMAL:
+        candidate = _candidate_from(solver, s2, art2, spec, sorted_fixtures, line_ids)
+        return _unproven_result("lines", spec, candidate)
     min_used = solver.Value(art2.total_used)
 
-    # 第三阶段：按灯具 ID 排序后的 (线路, 起始地址) 字典序最小化。
-    # CP-SAT 目标系数须落在 int63 内，因此前 K 台灯（权重不溢出部分）用
-    # B 进制大权重一次性精确最小化；K 之后逐台固定前缀精确求解。
-    # 规模过大导致精确破局超时时，回退到单次“扁平字典序”启发式（前两级
-    # 目标仍然严格最优），保证界面始终拿得到方案。
-    chosen, tie_exact = _lexicographic_phase(
+    # 第三阶段：迁移数、线路数固定为已证最优值，按灯具 ID 顺序逐台做
+    # （线路 ID, 起始地址）字典序最小化。每个前缀只在求解器返回 OPTIMAL
+    # 时才固定；任何一台未能证明，立即返回未证最优，不固定该台的值继续。
+    chosen, candidate = _lexicographic_phase(
         spec, sorted_fixtures, line_ids, min_mig, min_used
     )
     if chosen is None:
-        chosen = _lexicographic_fallback(spec, sorted_fixtures, line_ids, min_mig, min_used)
-        if chosen is None:
-            return SolveResult(
-                feasible=False,
-                conflicts=[
-                    {
-                        "type": "solver_timeout",
-                        "message": "字典序破局阶段超时，请重试或减少灯具数量。",
-                    }
-                ],
-            )
-        tie_exact = False
+        return _unproven_result("lexicographic", spec, candidate)
 
+    allocations = _allocations_from(spec, sorted_fixtures, chosen)
+    occupancy = _build_occupancy(spec, allocations)
+    used_lines = sum(1 for line in occupancy if line["used_channels"] > 0)
+    return SolveResult(
+        optimality=OPTIMAL,
+        allocations=allocations,
+        migration_count=sum(1 for a in allocations if a.migrated),
+        used_lines=used_lines,
+        occupancy=occupancy,
+    )
+
+
+def _candidate_from(solver, status, art, spec, sorted_fixtures, line_ids) -> list[Allocation] | None:
+    """阶段求解仅得 FEASIBLE 时，取出可展示（但不可发布）的 incumbent。"""
+    if status != cp_model.FEASIBLE:
+        return None
+    try:
+        chosen = _read_chosen(solver, art, sorted_fixtures, line_ids)
+    except Exception:
+        return None
+    return _allocations_from(spec, sorted_fixtures, chosen)
+
+
+def _allocations_from(spec: SolveSpec, sorted_fixtures, chosen: dict[int, tuple[int, int]]):
+    by_id = {f.id: f for f in spec.fixtures}
     allocations: list[Allocation] = []
     for f in sorted_fixtures:
         lid, st = chosen[f.id]
-        migrated = f.prev_line is not None and (f.prev_line, f.prev_start) != (lid, st)
+        fx = by_id[f.id]
+        migrated = fx.prev_line is not None and (fx.prev_line, fx.prev_start) != (lid, st)
         allocations.append(
             Allocation(
                 fixture_id=f.id,
@@ -461,101 +514,108 @@ def solve(spec: SolveSpec) -> SolveResult:
                 locked=f.locked,
             )
         )
+    return allocations
 
-    occupancy = _build_occupancy(spec, allocations)
-    used_lines = sum(1 for line in occupancy if line["used_channels"] > 0)
+
+def _unproven_result(stage: str, spec: SolveSpec, candidate: list[Allocation] | None) -> SolveResult:
+    allocations = candidate or []
+    occupancy = _build_occupancy(spec, allocations) if allocations else []
     return SolveResult(
-        feasible=True,
+        optimality=UNPROVEN,
+        unproven_stage=stage,
+        unproven_message=_UNPROVEN_MESSAGES[stage],
         allocations=allocations,
         migration_count=sum(1 for a in allocations if a.migrated),
-        used_lines=used_lines,
+        used_lines=sum(1 for line in occupancy if line["used_channels"] > 0),
         occupancy=occupancy,
-        tie_exact=tie_exact,
+        conflicts=[{"type": "unproven", "message": _UNPROVEN_MESSAGES[stage]}],
     )
 
 
 def _read_chosen(solver: cp_model.CpSolver, art: _ModelArtifacts, fixtures, line_ids):
     chosen = {}
     for f in fixtures:
-        lid = next(lid for lid in line_ids if solver.Value(art.present[f.id][lid]) == 1)
-        chosen[f.id] = (lid, solver.Value(art.starts[f.id]))
+        chosen_line = next(l for l in line_ids if solver.Value(art.present[f.id][l]) == 1)
+        chosen[f.id] = (chosen_line, solver.Value(art.starts[f.id]))
     return chosen
 
 
+def _max_packed_batch(n_lines: int) -> int:
+    """B 进制加权目标能在 int63 内打包多少台灯（base 见 LINE_PRIORITY_WEIGHT）。"""
+    base = LINE_PRIORITY_WEIGHT
+    digit_max = base * n_lines
+    cap = 2**62
+    k = 0
+    max_coeff = base  # 最末台灯的线路指数项系数
+    while k < 100 and max_coeff <= cap:
+        k += 1
+        max_coeff *= digit_max
+    return k
+
+
 def _lexicographic_phase(spec, sorted_fixtures, line_ids, min_mig, min_used):
-    """精确字典序破局：B 进制前缀 + 逐台固定。返回 (chosen|None, exact_bool)。"""
+    """逐级证明的字典序破局。
+
+    为减少求解次数，把 int63 权重能容纳的前若干台灯打成一个 B 进制加权
+    目标一次性求解；仅当返回 OPTIMAL 才固定整批，否则把批量减半重解，
+    直到单台灯求解仍非 OPTIMAL 时返回 (None, incumbent候选)。
+    未证明的任何取值都不会被固定。
+    """
+    n_lines = len(line_ids)
+    max_batch = _max_packed_batch(n_lines)
+    fixed: dict[int, tuple[int, int]] = {}
+    rest = list(sorted_fixtures)
+    candidate: list[Allocation] | None = None
+
+    while rest:
+        batch_size = min(max_batch, len(rest))
+        batch = rest[:batch_size]
+        while True:
+            model, art = _build_model(spec)
+            model.Add(art.total_mig == min_mig)
+            model.Add(art.total_used == min_used)
+            for fid, (lid, stv) in fixed.items():
+                model.Add(art.present[fid][lid] == 1)
+                model.Add(art.starts[fid] == stv)
+            terms = _packed_terms(art, batch, line_ids, batch_size)
+            model.Minimize(terms)
+            solver = cp_model.CpSolver()
+            solver.parameters.CopyFrom(
+                _params(SOLVE_SECONDS_PHASE if batch_size > 1 else SOLVE_SECONDS_TIE)
+            )
+            st = solver.Solve(model)
+            if st == cp_model.INFEASIBLE:
+                # 前两级目标值下不应发生；视为无法证明，交由上层处理
+                return None, candidate
+            if st == cp_model.OPTIMAL:
+                for f in batch:
+                    chosen_line = next(
+                        l for l in line_ids if solver.Value(art.present[f.id][l]) == 1
+                    )
+                    fixed[f.id] = (chosen_line, solver.Value(art.starts[f.id]))
+                rest = rest[batch_size:]
+                break
+            # FEASIBLE / UNKNOWN：这批没能证明。记下 incumbent 作为候选，
+            # 收缩批量重解；不固定本批任何取值。
+            candidate = _candidate_from(solver, st, art, spec, sorted_fixtures, line_ids)
+            if batch_size == 1:
+                return None, candidate
+            batch_size = max(1, batch_size // 2)
+            batch = batch[:batch_size]
+    return dict(fixed), None
+
+
+def _packed_terms(art, batch, line_ids, batch_size):
+    """batch 内按灯具顺序的 B 进制字典序加权目标（线路优先于起始地址）。"""
     base = LINE_PRIORITY_WEIGHT
     digit_max = base * len(line_ids)
-    cap = 2**62
-
-    packed_k = 0
-    max_coeff = base
-    n = len(sorted_fixtures)
-    while packed_k < n and max_coeff <= cap:
-        packed_k += 1
-        max_coeff *= digit_max
-
-    head, tail = sorted_fixtures[:packed_k], sorted_fixtures[packed_k:]
-    fixed: dict[int, tuple[int, int]] = {}
-    solver = cp_model.CpSolver()
-
-    if head:
-        model, art = _build_model(spec)
-        model.Add(art.total_mig == min_mig)
-        model.Add(art.total_used == min_used)
-        terms = []
-        for pos, f in enumerate(head):
-            w = digit_max ** (packed_k - 1 - pos)
-            for idx, lid in enumerate(line_ids):
-                terms.append(art.present[f.id][lid] * (idx * base) * w)
-            terms.append(art.starts[f.id] * w)
-        model.Minimize(sum(terms))
-        solver.parameters.CopyFrom(_params(SOLVE_SECONDS_PHASE))
-        st = solver.Solve(model)
-        if st == cp_model.INFEASIBLE:
-            return None, False
-        if st not in _FEASIBLE_STATUSES:
-            return None, False
-        for f in head:
-            lid = next(l for l in line_ids if solver.Value(art.present[f.id][l]) == 1)
-            fixed[f.id] = (lid, solver.Value(art.starts[f.id]))
-
-    for f in tail:
-        model, art = _build_model(spec)
-        model.Add(art.total_mig == min_mig)
-        model.Add(art.total_used == min_used)
-        for fid, (lid, stv) in fixed.items():
-            model.Add(art.present[fid][lid] == 1)
-            model.Add(art.starts[fid] == stv)
-        terms = [art.starts[f.id]] + [
-            art.present[f.id][lid] * idx * base for idx, lid in enumerate(line_ids)
-        ]
-        model.Minimize(sum(terms))
-        solver.parameters.CopyFrom(_params(SOLVE_SECONDS_TIE))
-        st = solver.Solve(model)
-        if st not in _FEASIBLE_STATUSES:
-            return None, False
-        lid = next(l for l in line_ids if solver.Value(art.present[f.id][l]) == 1)
-        fixed[f.id] = (lid, solver.Value(art.starts[f.id]))
-    return dict(fixed), True
-
-
-def _lexicographic_fallback(spec, sorted_fixtures, line_ids, min_mig, min_used):
-    """扁平字典序启发式：所有台灯等权（线路指数 + 起始地址），单次求解。"""
-    model, art = _build_model(spec)
-    model.Add(art.total_mig == min_mig)
-    model.Add(art.total_used == min_used)
     terms = []
-    for f in sorted_fixtures:
-        terms.extend(art.present[f.id][lid] * idx for idx, lid in enumerate(line_ids))
-        terms.append(art.starts[f.id])
-    model.Minimize(sum(terms))
-    solver = cp_model.CpSolver()
-    solver.parameters.CopyFrom(_params(SOLVE_SECONDS_PHASE))
-    st = solver.Solve(model)
-    if st not in _FEASIBLE_STATUSES:
-        return None
-    return _read_chosen(solver, art, sorted_fixtures, line_ids)
+    for pos, f in enumerate(batch):
+        w = digit_max ** (batch_size - 1 - pos)
+        for idx, lid in enumerate(line_ids):
+            terms.append(art.present[f.id][lid] * (idx * base) * w)
+        terms.append(art.starts[f.id] * w)
+    return sum(terms)
 
 
 def _build_occupancy(spec: SolveSpec, allocations: list[Allocation]) -> list[dict]:

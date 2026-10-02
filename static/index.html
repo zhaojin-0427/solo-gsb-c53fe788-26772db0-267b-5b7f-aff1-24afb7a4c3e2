@@ -32,6 +32,11 @@
         <span id="plan-summary" class="muted"></span>
       </div>
       <div id="stale-banner" class="banner warn hidden"></div>
+      <div id="unproven-panel" class="banner warn hidden">
+        <h2>⏳ 未证最优（不可发布）</h2>
+        <p id="unproven-msg"></p>
+        <p class="muted">求解器在限定时间内只找到可行候选，未能逐级证明“迁移台数最少 → 启用线路数最少 → 字典序最小”。下列排布仅供参考，未生成可发布草稿；请减少灯具数量或稍后重新生成预览。</p>
+      </div>
       <div id="conflict-panel" class="hidden">
         <h2>⚠️ 无可行方案，冲突约束如下</h2>
         <ul id="conflict-list"></ul>

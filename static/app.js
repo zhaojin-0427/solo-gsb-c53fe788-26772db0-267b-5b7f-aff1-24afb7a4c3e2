@@ -367,7 +367,8 @@ $("#btn-preview").addEventListener("click", generatePreview);
 async function generatePreview() {
   try {
     const result = await api("/api/plans/preview", { method: "POST" });
-    state.preview = result.feasible ? result : null;
+    // 只有逐级证明最优（optimal）的预览才可发布；未证最优结果不得进入发布流程。
+    state.preview = result.feasible && result.optimality_status === "optimal" ? result : null;
     renderPreview(result);
     await refreshVersion();
   } catch (err) {
@@ -377,8 +378,27 @@ async function generatePreview() {
 
 function renderPreview(p) {
   const conflictPanel = $("#conflict-panel");
+  const unprovenPanel = $("#unproven-panel");
   const migrationPanel = $("#migration-panel");
   const allocPanel = $("#alloc-panel");
+
+  if (p.optimality_status === "unproven") {
+    // 可行但未证最优：展示候选，同时明确不可发布。
+    unprovenPanel.classList.remove("hidden");
+    $("#unproven-msg").textContent = p.message || "未能在限定时间内证明最优。";
+    conflictPanel.classList.add("hidden");
+    allocPanel.classList.remove("hidden");
+    $("#plan-summary").textContent =
+      `候选预览（未证最优，不可发布）· 基于配置 v${p.config_version}` +
+      ` · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路`;
+    renderTracks(p.occupancy);
+    renderMigrations(p.migrations);
+    renderAllocations(p.allocations);
+    $("#btn-publish").disabled = true;
+    return;
+  }
+
+  unprovenPanel.classList.add("hidden");
 
   if (!p.feasible) {
     conflictPanel.classList.remove("hidden");
@@ -396,8 +416,8 @@ function renderPreview(p) {
   conflictPanel.classList.add("hidden");
   allocPanel.classList.remove("hidden");
   $("#plan-summary").textContent =
-    `预览 #${p.plan_id} · 基于配置 v${p.config_version} · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路` +
-    (p.tie_exact === false ? " · 规模较大，字典序为近似最优" : "");
+    `预览 #${p.plan_id} · 基于配置 v${p.config_version} · ✅ 已逐级证明最优` +
+    ` · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路`;
 
   renderTracks(p.occupancy);
   renderMigrations(p.migrations);
@@ -481,6 +501,14 @@ function renderAllocations(allocations) {
 
 $("#btn-publish").addEventListener("click", async () => {
   if (!state.preview) return;
+  if (state.preview.optimality_status !== "optimal") {
+    toast("该预览未证明最优，不能发布", "error");
+    return;
+  }
+  if (state.preview.config_version !== state.version) {
+    toast("配置版本已过期，请重新生成预览", "error");
+    return;
+  }
   if (!confirm("确认按当前预览原子发布？发布后旧预览立即失效。")) return;
   try {
     const result = await api(`/api/plans/${state.preview.plan_id}/publish`, { method: "POST" });

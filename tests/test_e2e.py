@@ -210,7 +210,7 @@ def test_13_deterministic_lexicographic_tiebreak():
     assert keys1 == keys2  # 确定性
     # 三台 10ch 都能放线路 1，字典序最小 => 全部 line 1，起始 1/11/21
     assert keys1 == [(1, 1), (1, 11), (1, 21)]
-    assert r1.tie_exact is True
+    assert r1.optimality == "optimal"
 
 
 def test_14_lexicographic_requires_second_line():
@@ -249,3 +249,265 @@ def test_15_unsatisfiable_lock_diagnostic():
     r = solve(spec)
     assert r.feasible is False
     assert any(c["type"] == "unsatisfiable_lock" for c in r.conflicts), r.conflicts
+
+
+def test_16_feasible_incumbent_at_migration_phase_is_unproven():
+    """第一阶段限时只拿到 FEASIBLE 时：返回未证最优，且不得固定值继续第二阶段。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (1, 2, 3)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    real_cls = cp_model.CpSolver
+
+    class Scripted(real_cls):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def Solve(self, model):  # noqa: N802
+            st = super().Solve(model)
+            self.calls += 1
+            # 第一次 Solve = 第一阶段；伪造为限时 FEASIBLE（incumbent 仍可读）
+            return cp_model.FEASIBLE if self.calls == 1 else st
+
+    slv.cp_model.CpSolver = Scripted
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    assert r.optimality == slv.UNPROVEN
+    assert r.unproven_stage == "migration"
+    assert r.feasible is True  # 带回了候选，但不可发布
+    assert r.has_candidate is True
+
+
+def test_17_phase_gating_no_fix_without_optimal():
+    """用计数假求解器验证：第一阶段非 OPTIMAL 时，第二、三阶段根本不会被调用。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (1, 2)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    calls = {"n": 0}
+    real_cls = cp_model.CpSolver
+
+    class OnlyFirstFeasible(real_cls):
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            calls["n"] += 1
+            return cp_model.FEASIBLE  # 第一阶段即未证最优
+
+    slv.cp_model.CpSolver = OnlyFirstFeasible
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    assert calls["n"] == 1  # 只求解了第一阶段，未固定值继续
+    assert r.optimality == slv.UNPROVEN
+    assert r.unproven_stage == "migration"
+
+
+def test_18_lexicographic_batch_shrinks_without_fixing():
+    """字典序批量未证最优时收缩批量，未证明的一批取值不被固定；最终仍可证明时给出最优。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    # 4 条线路时一个加权批最多打包 4 台；3 台灯一批完成
+    assert slv._max_packed_batch(4) >= 3
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (3, 7, 12)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    real_cls = cp_model.CpSolver
+    state = {"n": 0}
+
+    class FirstBatchFeasibleThenOptimal(real_cls):
+        """第一次字典序批量（3 台一起）返回 FEASIBLE，之后收缩为逐台求解均 OPTIMAL。
+
+        迁移/线路阶段发生在字典序之前：共 2 次 Solve，需让它们正常返回。
+        """
+
+        def Solve(self, model):  # noqa: N802
+            st = super().Solve(model)
+            state["n"] += 1
+            if state["n"] == 3:  # 第一次字典序批量求解
+                return cp_model.FEASIBLE
+            return st  # 收缩后逐台 OPTIMAL
+
+    slv.cp_model.CpSolver = FirstBatchFeasibleThenOptimal
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    # 批量为 3 时 FEASIBLE -> 批量 1（ID 3）OPTIMAL 固定；再 ID 7、ID 12 各一次
+    assert r.optimality == slv.OPTIMAL
+    keys = [(a.line_id, a.start) for a in sorted(r.allocations, key=lambda a: a.fixture_id)]
+    assert keys == [(1, 1), (1, 11), (1, 21)]
+
+
+def test_19_lexicographic_single_fixture_timeout_is_unproven():
+    """收缩到单台灯仍无法证明时：返回未证最优，且该台取值未被固定。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (3, 7)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    real_cls = cp_model.CpSolver
+    state = {"n": 0}
+
+    class TimeoutLexTail(real_cls):
+        def Solve(self, model):  # noqa: N802
+            st = super().Solve(model)
+            state["n"] += 1
+            if state["n"] == 3:  # 字典序唯一一次批量（2 台）未证明
+                return cp_model.FEASIBLE
+            if state["n"] >= 4:  # 收缩到单台仍未证明
+                return cp_model.FEASIBLE
+            return st
+
+    slv.cp_model.CpSolver = TimeoutLexTail
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    assert r.optimality == slv.UNPROVEN
+    assert r.unproven_stage == "lexicographic"
+    assert r.feasible is True  # 有候选
+    # 不可被当作最优：不生成计划由 API 层测试覆盖
+
+
+def test_20_preview_unproven_creates_no_draft(client):
+    """HTTP：第一阶段 FEASIBLE -> 200 + optimality_status=unproven，且不生成草稿。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app.database import SessionLocal
+    from app.models import Plan
+
+    # 清理前面用例遗留的互斥/撞保留区锁定灯具，使配置恢复可解
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    for name in ("Lk1", "Lk2", "Lk3"):
+        if name in fx:
+            assert client.delete(f"/api/fixtures/{fx[name]['id']}").status_code == 204
+
+    with SessionLocal() as db:
+        drafts_before = db.query(Plan).filter(Plan.status == "draft").count()
+
+    real_cls = cp_model.CpSolver
+
+    class FirstFeasible(real_cls):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            self._n += 1
+            return cp_model.FEASIBLE if self._n == 1 else cp_model.OPTIMAL
+
+    planner.solver.cp_model.CpSolver = FirstFeasible
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is True
+    assert p["optimality_status"] == "unproven"
+    assert p["unproven_stage"] == "migration"
+    assert "plan_id" not in p and "id" not in p  # 未生成草稿
+    assert p["conflicts"] and p["conflicts"][0]["type"] == "unproven"
+
+    with SessionLocal() as db:
+        drafts_after = db.query(Plan).filter(Plan.status == "draft").count()
+    assert drafts_after == drafts_before
+
+
+def test_21_legacy_draft_without_proof_is_rejected(client):
+    """无 optimality_status 证明记录的遗留草稿（或未证最优草稿）一律拒发。"""
+    from app.database import SessionLocal
+    from app.models import Plan, PlanAllocation
+    from app.services import get_config_version
+
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="draft",
+            optimality_status=None,
+            migration_count=0,
+            used_lines=1,
+        )
+        db.add(plan)
+        db.flush()
+        db.add(
+            PlanAllocation(
+                plan_id=plan.id, fixture_id=1, line_id=1, start=1, end=10, migrated=False
+            )
+        )
+        db.commit()
+        legacy_id = plan.id
+
+    r = client.post(f"/api/plans/{legacy_id}/publish")
+    assert r.status_code == 409
+    assert "最优" in r.json()["detail"]
+
+    # 未证最优状态同样拒发（即使版本匹配）
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="draft",
+            optimality_status="unproven",
+            migration_count=0,
+            used_lines=1,
+        )
+        db.add(plan)
+        db.commit()
+        unproven_id = plan.id
+    r = client.post(f"/api/plans/{unproven_id}/publish")
+    assert r.status_code == 409
+    assert "最优" in r.json()["detail"]
+
+
+def test_22_optimal_preview_persists_and_publishes(client):
+    """成功预览持久化 optimality_status=optimal，查询与发布均可核对。"""
+    from app.database import SessionLocal
+    from app.models import Plan
+
+    p = client.post("/api/plans/preview").json()
+    assert p["optimality_status"] == "optimal"
+    plan_id = p["plan_id"]
+
+    got = client.get(f"/api/plans/{plan_id}").json()
+    assert got["optimality_status"] == "optimal"
+
+    with SessionLocal() as db:
+        assert db.get(Plan, plan_id).optimality_status == "optimal"
+
+    r = client.post(f"/api/plans/{plan_id}/publish")
+    assert r.status_code == 200, r.text
+    assert r.json()["optimality_status"] == "optimal"

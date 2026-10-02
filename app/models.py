@@ -115,6 +115,9 @@ class Plan(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     config_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    # 最优性结论：optimal 表示三级目标均已证明最优，方可发布；
+    # NULL 仅出现在旧版本遗留草稿上，发布时一律拒绝。
+    optimality_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     migration_count: Mapped[int] = mapped_column(Integer, nullable=False)
     used_lines: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
